@@ -1,0 +1,73 @@
+image: ${CI_REGISTRY}/libs/container-images/build-java-maven:17
+
+cache:
+  paths:
+    - .m2/repository/
+
+unit-test-job:
+  stage: test
+  variables:
+    # Points the tests at the service container below instead of 127.0.0.1.  Every bucket lives in the
+    # cluster, so this covers the whole bucket4j-webapp suite.  Setting it also makes those tests fail
+    # rather than skip if the cluster is unreachable, so a broken service cannot leave the build green.
+    VALKEY_HOST: valkey
+    # Put the job and its services on a network created for this build.  Required for the service's
+    # HEALTHCHECK_TCP_PORT below to be honoured at all: on the default bridge the runner instead takes the
+    # health check address and port from Docker's legacy link variables, which come from the image's
+    # EXPOSE 6379 and cannot be overridden.
+    FF_NETWORK_PER_BUILD: "true"
+  services:
+    # One container running a 3-node cluster on 7001-7003.  The nodes share the container's loopback, so
+    # the cluster forms the same way it does locally (see docker/valkey-cluster.md), and each node
+    # announces the container's own IP -- the address the job container can actually route to.  Announcing
+    # 127.0.0.1, as the local script does, would send the client to its own loopback.
+    - name: valkey/valkey:7.2.6
+      alias: valkey
+      variables:
+        # The runner waits for a TCP connection to the image's exposed port, which is 6379 -- a port no node
+        # here listens on, so without this the service is declared dead before the job starts.  Only read on
+        # a user-defined network, hence FF_NETWORK_PER_BUILD above.
+        HEALTHCHECK_TCP_PORT: "7001"
+      entrypoint: ["/bin/sh", "-c"]
+      command:
+        - |
+          set -e
+          # Must be the IPv4 address: on a dual-stack runner `hostname -i` lists the IPv6 address first, and
+          # an IPv6 announce address needs bracket syntax that valkey-cli's --cluster create does not apply.
+          ANNOUNCE_IP=$(getent ahostsv4 "$(hostname)" | awk '{print $1; exit}')
+          if [ -z "${ANNOUNCE_IP}" ]; then
+            ANNOUNCE_IP=$(hostname -i | tr ' ' '\n' | grep -v : | head -1)
+          fi
+          if [ -z "${ANNOUNCE_IP}" ]; then
+            echo "could not determine this container's IPv4 address" >&2
+            exit 1
+          fi
+          echo "cluster nodes will announce ${ANNOUNCE_IP}"
+          for port in 7001 7002 7003; do
+            valkey-server \
+              --port "${port}" \
+              --cluster-enabled yes \
+              --cluster-config-file "nodes-${port}.conf" \
+              --cluster-node-timeout 5000 \
+              --cluster-announce-ip "${ANNOUNCE_IP}" \
+              --cluster-announce-port "${port}" \
+              --cluster-announce-bus-port "$((port + 10000))" \
+              --appendonly no \
+              --bind 0.0.0.0 \
+              --protected-mode no \
+              --maxmemory-policy noeviction \
+              --loglevel warning &
+          done
+          for port in 7001 7002 7003; do
+            until valkey-cli -p "${port}" ping 2>/dev/null | grep -q PONG; do sleep 0.2; done
+          done
+          valkey-cli --cluster create \
+            "${ANNOUNCE_IP}:7001" "${ANNOUNCE_IP}:7002" "${ANNOUNCE_IP}:7003" --cluster-yes
+          wait
+  artifacts:
+    expire_in: 10 days
+    when: always
+    reports:
+      junit: "**/target/surefire-reports/*.xml"
+  script:
+    - mvn test
